@@ -1206,13 +1206,13 @@ sys.setrecursionlimit(100000)  # or a higher value
 
 import pandas as pd
 
-task =["redox_potential","solvation_free_energy"]#["solvation_free_energy"] #
+task =["logP","TPSA"]
 featurizer = MolMergerFeaturizer(use_edges = True)
-dataset_file = "./redox_solvation_data.csv"
+dataset_file = "./logP_TPSA_data.csv"
 
 loader = dc.data.CSVLoader(
     tasks = task,
-    smiles_field = "ox_smiles",
+    smiles_field = "smiles",
     featurizer = featurizer
 )
 
@@ -1338,7 +1338,7 @@ class BayesianGaussianHead(nn.Module):
         return self.head_mu.kl_loss() + self.head_logvar.kl_loss()
 
 
-tasks = ["redox_potential", "solvation_free_energy"]
+tasks = ["logP", "TPSA"]
 
 train, test = splitter.train_test_split(dataset, seed=42, frac_train=0.5)
 
