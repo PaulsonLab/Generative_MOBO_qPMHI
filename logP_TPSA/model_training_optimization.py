@@ -1832,4 +1832,530 @@ fig_cal_recal = plot_calibration_curve(gaus_pred_recal, errors_observed_recal, m
 
 
 
+#############################################################################################
+
+#optimization loop
+
+#############################################################################################
+
+
+#%% ga + qmphi 
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Genetic + qPMHI over SMILES with:
+- Monotone HV tracking on an append-only archive
+- Elitist trimming for the working population
+- Batch tracking and saving
+- Acquisition tweaks to combat TPSA stagnation:
+    * Weighted objectives in qPHV (EMPHASIZE_TPSA)
+    * Reserved TPSA-booster picks (UCB on -TPSA)
+
+Environment requirements:
+- `df`: pandas.DataFrame with "smiles" or "ox_smiles"
+- `pt_predictor` with:
+      .gnn(graph, node_feats, edge_feats) -> node embeddings
+      .readout(graph, node_embeddings) -> graph embedding
+      .predict(graph_embedding) -> tensor [N, 2] as [logP, TPSA]
+- `smiles_to_graph(smi) -> dgl.DGLGraph` with ndata['x'], edata['edge_attr']
+"""
+
+import os, json, random, warnings, multiprocessing
+from typing import List, Tuple
+from functools import lru_cache
+
+import numpy as np
+import torch
+import dgl
+from rdkit import Chem
+from rdkit.Chem import Crippen, rdMolDescriptors
+from deap import base, creator, tools, algorithms
+
+from botorch.utils.multi_objective.hypervolume import DominatedPartitioning
+from botorch.utils.multi_objective.pareto import is_non_dominated
+
+# --------------------------- CONFIG ---------------------------
+#DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+for seed in [1,2,3,4,5]:
+    # Working population / rounds
+    POP_SIZE       = 1500
+    ROUNDS         = 5
+    BATCH_SIZE     = 100
+    
+    # Draw counts
+    S_DRAW_QPHV    = 256    # Thompson draws for qPHV
+    S_DRAW_STATS   = 128    # draws for archive HV measurement
+    S_DRAW_FAST    = 64     # faster draws for GA/trim
+    
+    KAPPA_START    = 5.0
+    KAPPA_END      = 0.3
+    
+    
+    EMPHASIZE_TPSA = 1.0    
+    TPSA_BOOST_K   = 0     
+    TPSA_TAU       = 1.0    
+    
+    SEED           = seed
+    SAVE_PREFIX    = "run_qphv_ga" + str(seed)  
+    # --------------------------------------------------------------
+    
+    
+    # -------------------- environment checks ---------------------
+    def _require_globals():
+        missing = []
+        if 'df' not in globals():
+            missing.append("df")
+        if 'pt_predictor' not in globals():
+            missing.append("pt_predictor")
+        if 'smiles_to_graph' not in globals():
+            missing.append("smiles_to_graph")
+        if missing:
+            raise RuntimeError(
+                f"Missing required globals: {missing}. "
+                "Please define them before running this script."
+            )
+    
+    # ---------------------- utils & seeding ----------------------
+    def seed_all(seed: int = 0):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    
+    def is_valid(m: Chem.Mol) -> bool:
+        if m is None:
+            return False
+        try:
+            Chem.SanitizeMol(m)
+        except Exception:
+            return False
+        return "." not in Chem.MolToSmiles(m, True)
+    
+    
+    # ---------------------- fragment mining ----------------------
+    def mine_fragments(base_smiles: List[str]) -> List[str]:
+        """Parallel call to user-provided `fragment.get_frags` if available; else
+        augment with simple building blocks."""
+        frags = []
+        try:
+            from fragment import get_frags  # user module
+            with multiprocessing.Pool() as pool:
+                raw_frags = pool.map(get_frags, base_smiles)
+            frags = [f for sub in raw_frags for f in sub if is_valid(Chem.MolFromSmiles(f))]
+        except Exception as exc:
+            print("Fragment mining failed or `fragment.get_frags` missing:", exc)
+    
+        # add simple building blocks regardless
+        ALKYL  = ["C"*n for n in range(3, 10)]  # C3–C9
+        AROMA  = ["c1ccccc1", "c1cccc(c1)c1ccccc1"]  # phenyl, biphenyl
+        HALO   = ["C(F)(F)F", "C(F)(F)C(F)(F)F"]     # CF3, C2F6
+        frags += ALKYL + AROMA + HALO
+    
+        # dedupe & validate
+        uniq = list({f for f in frags if is_valid(Chem.MolFromSmiles(f))})
+        if not uniq:
+            raise RuntimeError("Fragment list empty after mining.")
+        random.shuffle(uniq)
+        print(f"Fragment count: {len(uniq)}")
+        return uniq
+    
+    
+    # -------------------- genetic operators ----------------------
+    def _random_bond_idx(m: Chem.Mol):
+        nb = m.GetNumBonds()
+        if nb == 0:
+            return None
+        return random.randrange(nb)
+    
+    def attach_fragment(mol: Chem.Mol, frag_smi: str):
+        frag = Chem.MolFromSmiles(frag_smi)
+        if mol is None or frag is None:
+            return None
+        combo = Chem.RWMol(Chem.CombineMols(mol, frag))
+        # pick a random atom in the base + first atom of fragment
+        i  = random.randrange(mol.GetNumAtoms())
+        j0 = mol.GetNumAtoms()  # first atom index of frag in combined mol
+        combo.AddBond(i, j0, Chem.BondType.SINGLE)
+        child = combo.GetMol()
+        return child if is_valid(child) else None
+    
+    def mutate(smi: str, sub_frags: List[str], tries: int = 20, max_sites: int = 3) -> str:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            return smi
+        for _ in range(tries):
+            child = mol
+            for _ in range(random.randint(1, max_sites)):
+                frag_smi = random.choice(sub_frags)
+                child = attach_fragment(child, frag_smi) or child
+            if child and is_valid(child):
+                return Chem.MolToSmiles(child, True)
+        return smi
+    
+    def crossover(a_smi: str, b_smi: str) -> Tuple[str, str]:
+        a, b = Chem.MolFromSmiles(a_smi), Chem.MolFromSmiles(b_smi)
+        if a is None or b is None:
+            return a_smi, b_smi
+        ba, bb = _random_bond_idx(a), _random_bond_idx(b)
+        if ba is None or bb is None:
+            return a_smi, b_smi
+        try:
+            frag_a = Chem.FragmentOnBonds(a, [ba], addDummies=True)
+            frag_b = Chem.FragmentOnBonds(b, [bb], addDummies=True)
+            prod1 = Chem.CombineMols(frag_a, frag_b)
+            prod2 = Chem.CombineMols(frag_b, frag_a)
+            m1 = Chem.MolFromSmiles(Chem.MolToSmiles(prod1))
+            m2 = Chem.MolFromSmiles(Chem.MolToSmiles(prod2))
+            if is_valid(m1) and is_valid(m2):
+                return Chem.MolToSmiles(m1, True), Chem.MolToSmiles(m2, True)
+        except Exception:
+            pass
+        return a_smi, b_smi
+    
+    
+    # ----------------- surrogate draws & stats -------------------
+    @torch.no_grad()
+    def _batch_graphs(smis: Tuple[str, ...]) -> dgl.DGLGraph:
+        g = dgl.batch([smiles_to_graph(s) for s in smis]).to(device)
+        return g
+    
+    @torch.no_grad()
+    def afp_draws(smis: List[str], S: int = 256, weights: Tuple[float,float]=(1.0,1.0)) -> torch.Tensor:
+        """
+        Thompson-like draws from the surrogate:
+        returns tensor of shape (S, N, 2) with columns [logP, -TPSA] (maximize both).
+        Optional 'weights' rescales objectives for acquisition emphasis.
+        """
+        w1, w2 = weights
+        g = _batch_graphs(tuple(smis))
+        node, edge = g.ndata['x'], g.edata['edge_attr']
+        outs = []
+        for _ in range(S):
+            h  = pt_predictor.gnn(g, node, edge)
+            gf = pt_predictor.readout(g, h)
+            y  = pt_predictor.predict(gf)              # [N, 2] as [logP, TPSA]
+            yy = torch.stack([y[:, 0], -y[:, 1]], -1)  # flip TPSA
+            yy = torch.stack([w1 * yy[:, 0], w2 * yy[:, 1]], -1)
+            outs.append(yy)
+        return torch.stack(outs, 0)
+    
+    @torch.no_grad()
+    def surrogate_mu_sigma(smis: List[str], n: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return mean, sigma tensors of shape (N,2) for (logP, -TPSA)."""
+        draws = afp_draws(smis, n, weights=(1.0, 1.0))
+        return draws.mean(0), draws.std(0)
+    
+    def _stdise(Y, mean, std): 
+        return (Y - mean) / std.clamp_min(1e-8)
+    
+    def pareto_prob_from_samples(samples: torch.Tensor) -> torch.Tensor:
+        """
+        samples : (S, N, 2)
+        Returns : (N,) P(point is non-dominated in a draw)
+        """
+        S, N = samples.shape[:2]
+        counts = torch.zeros(N, device=samples.device, dtype=torch.double)
+        for s in range(S):
+            nd_mask = is_non_dominated(samples[s])   # bool (N,)
+            counts += nd_mask.to(dtype=torch.double)
+        return counts / S
+    
+    def qphv_prob_from_samples(samples: torch.Tensor, Y_train: torch.Tensor, ref: torch.Tensor):
+        """
+        Monte-Carlo probability that a point gives the largest HV gain.
+        samples: (S, N, 2) draws (possibly weighted)
+        Y_train: (M, 2) observed (same weighting as `samples`)
+        ref    : (2,) reference in standardized space
+        Returns: (N,) probs
+        """
+        S, N = samples.shape[:2]
+        r_x, r_y = ref
+        
+        mask = is_non_dominated(Y_train)
+        F = Y_train[mask]
+        order = torch.argsort(F[:, 0])
+        xF, yF = F[order, 0], F[order, 1]
+        x_ext = torch.cat([r_x.view(1), xF, torch.tensor([float('inf')], dtype=r_x.dtype, device=r_x.device)])
+        y_ext = torch.cat([r_y.view(1), yF, torch.tensor([-float('inf')], dtype=r_x.dtype, device=r_x.device)])
+    
+        
+        x_all = samples[..., 0].reshape(-1)
+        y_all = samples[..., 1].reshape(-1)
+    
+        j = torch.searchsorted(x_ext, x_all).clamp_max(x_ext.size(0) - 1)
+        widths  = (x_all - x_ext[j - 1]).clamp_min(0)
+        heights = (y_all - r_y).clamp_min(0)
+        gain = torch.zeros_like(widths)
+        ok = y_all > y_ext[j]
+        gain[ok] = widths[ok] * heights[ok]
+    
+        winners = gain.view(S, N).argmax(1)
+        counts  = torch.bincount(winners, minlength=N)
+        return counts / S
+    
+    def qphv_prob_scaled(samples: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        mean, std = Y.mean(0), Y.std(0)
+        P = qphv_prob_from_samples(_stdise(samples, mean, std),
+                                   _stdise(Y, mean, std),
+                                   ref=_stdise(Y, mean, std).min(0).values - 1.0)
+        return P
+    
+    def pareto_prob_scaled(samples: torch.Tensor) -> torch.Tensor:
+        mean, std = samples.mean((0,1)), samples.std((0,1))
+        return pareto_prob_from_samples(_stdise(samples, mean, std))
+    def select_qphv(pop_smis: List[str], B: int = 50, S: int = 256,
+                    eps: float = 1e-12, weights: Tuple[float,float]=(1.0,1.0),
+                    tpsa_boost_k: int = 0, tpsa_tau: float = 2.0) -> List[int]:
+        """
+        qPHV selection with optional per-dimension weighting and TPSA booster picks.
+        weights: (w1, w2) rescales objectives during acquisition (not measurement).
+        tpsa_boost_k: reserve this many slots for UCB on -TPSA (to fight stagnation).
+        """
+        B_main = max(0, B - tpsa_boost_k)
+    
+        
+        samples = afp_draws(pop_smis, S, weights=weights)     
+        
+        Y_mu_unw, _ = surrogate_mu_sigma(pop_smis, n=16)      
+        Yw = torch.stack([weights[0]*Y_mu_unw[:,0], weights[1]*Y_mu_unw[:,1]], -1)
+    
+        p = qphv_prob_scaled(samples, Yw)                     # (N,) on DEVICE
+    
+        idx = torch.nonzero(p > eps).squeeze(-1)
+        idx = idx[torch.argsort(p[idx], descending=True)]
+        k   = min(idx.numel(), B_main)
+        sel = idx[:k].tolist()
+    
+        if k < B_main:
+            msk = torch.ones(len(pop_smis), dtype=torch.bool, device=p.device)
+            if len(sel) > 0:
+                msk[idx[:k]] = False                          # same-device masking
+            pp = pareto_prob_scaled(samples[:, msk])          # DEVICE
+            extra = torch.topk(pp, B_main - k).indices        # DEVICE
+            
+            pool_idx = torch.nonzero(msk, as_tuple=False).squeeze(-1)  # DEVICE
+            sel += pool_idx[extra].tolist()
+    
+        
+        if tpsa_boost_k > 0:
+            mu, sig = surrogate_mu_sigma(pop_smis, n=32)      
+            score = mu[:, 1] + tpsa_tau * sig[:, 1]           
+    
+            # build mask on same device as score
+            mask = torch.ones(len(pop_smis), dtype=torch.bool, device=score.device)
+            if len(sel) > 0:
+                mask[torch.as_tensor(sel, device=score.device, dtype=torch.long)] = False
+    
+            k2 = min(tpsa_boost_k, int(mask.sum().item()))
+            if k2 > 0:
+                
+                extra_local = torch.topk(score[mask], k2).indices
+                base_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # DEVICE
+                candidates = base_idx[extra_local].tolist()                  # python list
+                sel += candidates
+    
+        return sel
+    
+    
+    
+    
+    # ---------------- fitness & hypervolume ----------------------
+    def make_fitness_vec(mu: torch.Tensor, sig: torch.Tensor, kappa: float) -> List[Tuple[float, float]]:
+        """Two-objective maximization vector for GA selection (μ + κσ) on (logP, -TPSA)."""
+        f1 = (mu[:, 0] + kappa * sig[:, 0]).tolist()  # logP (↑)
+        f2 = (mu[:, 1] + kappa * sig[:, 1]).tolist()  # -TPSA (↑)
+        return list(zip(f1, f2))
+    
+    def hypervolume(mu: torch.Tensor, ref_pt: torch.Tensor) -> float:
+        return DominatedPartitioning(ref_pt, mu).compute_hypervolume().item()
+    
+    
+    # -------------------- DEAP (MO) toolbox ---------------------
+    def build_deap_toolbox(sub_frags: List[str]):
+        if not hasattr(creator, "Fit2"):
+            creator.create("Fit2", base.Fitness, weights=(1.0, 1.0))
+        if not hasattr(creator, "IndMO"):
+            creator.create("IndMO", str, fitness=creator.Fit2)
+    
+        toolbox = base.Toolbox()
+        toolbox.register("mate",   lambda a, b: (
+            creator.IndMO(crossover(str(a), str(b))[0]),
+            creator.IndMO(crossover(str(a), str(b))[1]),
+        ))
+        toolbox.register("mutate", lambda i: (creator.IndMO(mutate(str(i), sub_frags)),))
+        toolbox.register("select", tools.selNSGA2)
+        return toolbox
+    
+    
+    # -------------------- GA step (surrogate) -------------------
+    def ga_step(pop_smis: List[str], toolbox, kappa_t: float,
+                cxpb: float = 0.9, mutpb: float = 0.1) -> List[str]:
+        # parents
+        parents = [creator.IndMO(s) for s in pop_smis]
+    
+        # offspring
+        offspring = algorithms.varAnd(parents, toolbox, cxpb, mutpb)
+    
+        # evaluate all (parents + offspring) under μ,σ with kappa
+        combined = parents + offspring
+        smis_all = [str(ind) for ind in combined]
+        mu, sig  = surrogate_mu_sigma(smis_all, n=S_DRAW_FAST)
+        fits_all = make_fitness_vec(mu, sig, kappa_t)
+        for ind, fit in zip(combined, fits_all):
+            ind.fitness.values = fit
+    
+        # NSGA-II selection to keep |pop|
+        selected = toolbox.select(combined, len(pop_smis))
+        return [str(ind) for ind in selected]
+    
+    
+    # ---------------- population trimming (elitism) --------------
+    def trim_population(pop_smis: List[str], target_size: int) -> List[str]:
+        """Trim with elitism w.r.t. (mean, -TPSA) means (the **measurement** objectives)."""
+        if len(pop_smis) <= target_size:
+            return pop_smis
+        mu, _ = surrogate_mu_sigma(pop_smis, n=S_DRAW_FAST)
+        nd = is_non_dominated(mu)
+        nd_smis = [s for s, keep in zip(pop_smis, nd.tolist()) if keep]
+    
+        if len(nd_smis) >= target_size:
+            # Farthest-first in mean-space for diversity (simple crowding proxy).
+            M = mu[nd]
+            keep = [0]
+            while len(keep) < target_size and len(keep) < M.size(0):
+                rest = [i for i in range(M.size(0)) if i not in keep]
+                d = torch.cdist(M[keep], M[rest]).min(0).values
+                keep.append(rest[int(torch.argmax(d))])
+            return [nd_smis[i] for i in keep]
+    
+        # If ND set smaller than target, fill with dominated solutions (first-come)
+        dom_smis = [s for s in pop_smis if s not in set(nd_smis)]
+        return nd_smis + dom_smis[:(target_size - len(nd_smis))]
+    
+    
+    # ------------------- Archive & HV tracking -------------------
+    def update_archive(archive_smis: List[str], new_smis: List[str]) -> Tuple[List[str], torch.Tensor]:
+        # union
+        all_smis = list({*archive_smis, *new_smis})
+        mu_all, _ = surrogate_mu_sigma(all_smis, n=S_DRAW_STATS)
+        nd_mask = is_non_dominated(mu_all)
+        nd_smis = [s for s, keep in zip(all_smis, nd_mask.tolist()) if keep]
+        return nd_smis, mu_all[nd_mask]
+    
+    
+    
+    _require_globals()
+    seed_all(SEED)
+    warnings.filterwarnings("ignore")
+    
+    # ensure predictor on device
+    try:
+        pt_predictor.eval().to(device)  # type: ignore
+    except Exception:
+        pass
+    
+    # base pool & fragments
+    df = pd.read_csv('./logP_TPSA_data.csv')
+    col = "ox_smiles" if "ox_smiles" in df.columns else "smiles"
+    base_smiles = df[col].dropna().unique().tolist()
+    df_frags = pd.read_csv('./fragments.csv')
+    sub_frags = df_frags.frag_smiles.tolist()
+    toolbox = build_deap_toolbox(sub_frags)
+    
+    # initial working population
+    population = df[col].dropna().sample(POP_SIZE, random_state=SEED).tolist()
+    
+    # initial HV reference on initial μ over the working population
+    mu0, _ = surrogate_mu_sigma(population, n=S_DRAW_STATS)
+    ref_pt = mu0.min(0).values - 1.0
+    
+    # initialize archive and HV history (monotone)
+    archive = population.copy()
+    hv0 = hypervolume(mu0, ref_pt)
+    hv_hist = [hv0]
+    print(f"HV initial: {hv0:.4e}")
+    
+    # batch recorder
+    all_batches: List[List[str]] = []
+    
+    # kappa schedule
+    def kappa(t: int) -> float:
+        if ROUNDS == 1:
+            return KAPPA_END
+        alpha = (t - 1) / (ROUNDS - 1)
+        return (1 - alpha) * KAPPA_START + alpha * KAPPA_END
+    
+    for t in range(1, ROUNDS + 1):
+        print(f"\n ============ ROUND {t}/{ROUNDS} ===================")
+    
+        # 1) qPHV batch from the current candidate pool (population here;
+        #    if you have a larger fixed pool, set cand_pool to that instead).
+        cand_pool = population
+        if len(cand_pool) < BATCH_SIZE:
+            batch = cand_pool
+        else:
+            w = (1.0, EMPHASIZE_TPSA)  # tilt toward -TPSA if needed
+            batch_idx = select_qphv(
+                cand_pool, BATCH_SIZE, S=S_DRAW_QPHV,
+                weights=w,
+                tpsa_boost_k=TPSA_BOOST_K,
+                tpsa_tau=TPSA_TAU,
+            )
+            batch = [cand_pool[i] for i in batch_idx]
+    
+        # record batch
+        all_batches.append(batch)
+    
+        # quick monitor (chem-meaningful)
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import RDConfig
+            import os
+            import sys
+            sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
+            # now you can import sascore!
+            import sascorer
+            best_lp = max(Crippen.MolLogP(Chem.MolFromSmiles(s)) for s in batch)
+            best_tpsa = min(rdMolDescriptors.CalcTPSA(Chem.MolFromSmiles(s)) for s in batch)
+            print(f"🏷  best batch logP ≈ {best_lp:.3f}   min TPSA ≈ {best_tpsa:.1f}")
+        except Exception:
+            pass
+    
+        # 2) evolve working population by NSGA-II under μ+κσ
+        population = ga_step(population, toolbox, kappa(t))
+    
+        # 3) merge acquisition picks, then trim with elitism (measurement objectives)
+        population = list({*population, *batch})
+        population = trim_population(population, POP_SIZE)
+    
+        # 4) update archive with new evaluations and compute HV on archive (monotone)
+        archive, mu_archive = update_archive(archive, batch)
+        hv = hypervolume(mu_archive, ref_pt)
+        hv_hist.append(hv)
+        print(f"HV after round {t}: {hv:.4e}")
+    
+    # ----- save tracked outputs -----
+    # Flatten and dedupe all selected SMILES
+    all_selected_smis = list({s for b in all_batches for s in b})
+    
+    with open(f"{SAVE_PREFIX}_selected_batches.json", "w") as f:
+        json.dump(all_batches, f, indent=2)
+    
+    with open(f"{SAVE_PREFIX}_all_selected_smis.txt", "w") as f:
+        for s in all_selected_smis:
+            f.write(s + "\n")
+    
+    with open(f"{SAVE_PREFIX}_hv_history.json", "w") as f:
+        json.dump(hv_hist, f, indent=2)
+    
+    print(f"\nHyper-volume trajectory: {hv_hist}")
+    print(f"Total unique SMILES selected: {len(all_selected_smis)}")
+    print(f"Saved: '{SAVE_PREFIX}_selected_batches.json', "
+          f"'{SAVE_PREFIX}_all_selected_smis.txt', '{SAVE_PREFIX}_hv_history.json'")
+    
+
 
